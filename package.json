@@ -1,0 +1,21 @@
+{
+  "name": "kimi-proxy",
+  "version": "3.0.0",
+  "description": "HTTP proxy for Kimi Code CLI — turn your membership into a local LAN API",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "pino": "^8.16.0"
+  },
+  "keywords": [
+    "kimi",
+    "kimi-code",
+    "ai-proxy",
+    "http-proxy",
+    "local-ai",
+    "docker"
+  ],
+  "license": "MIT"
+}

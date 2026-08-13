@@ -1,0 +1,29 @@
+services:
+  kimi-proxy:
+    build: .
+    container_name: kimi-proxy
+    ports:
+      - "${SERVER_PORT:?Set SERVER_PORT in .env}:8080"
+    volumes:
+      - ./data:/app/data:rw
+      - ./logs:/app/logs:rw
+      - "${HOST_KIMI_CODE_PATH:?Set HOST_KIMI_CODE_PATH in .env}:/root/.kimi-code:rw"
+      - ./server.js:/app/server.js:ro
+    environment:
+      - PORT=8080
+      - DATA_DIR=/app/data
+      - LOGS_DIR=/app/logs
+      - LOG_LEVEL=${LOG_LEVEL:-info}
+      - LOG_SENSITIVE=${LOG_SENSITIVE:-false}
+      - KIMI_TIMEOUT_MS=${KIMI_TIMEOUT_MS:-300000}
+      - KIMI_CODE_BIN_DIR=/root/.kimi-code/bin
+    stdin_open: true
+    tty: true
+    restart: unless-stopped
+    working_dir: /app
+    healthcheck:
+      test: [CMD, curl, -f, http://localhost:8080/health]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 20s
