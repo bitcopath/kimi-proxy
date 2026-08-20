@@ -64,6 +64,8 @@ The only value you really need is `HOST_KIMI_CODE_PATH`.
 | `SERVER_PORT` | Free port on your server. | `8083` |
 | `HOST_KIMI_CODE_PATH` | Where Kimi Code stores your login on the server. | `/home/yourname/.kimi-code` |
 | `KIMI_TIMEOUT_MS` | How long one call can run. | `300000` (5 min) |
+| `PROXY_API_KEY` | Optional Bearer key for the `/v1/*` endpoints. | _(empty = LAN open)_ |
+| `KIMI_V1_MODEL` | Model id reported by `/v1/models`. | `kimi-code` |
 | `LOG_LEVEL` | How chatty the logs are. | `info` |
 | `LOG_SENSITIVE` | Set to `true` only while debugging. | `false` |
 
@@ -139,6 +141,41 @@ Response:
 ### `GET /health`
 
 Returns `{"status":"ok"}` when the proxy is alive and can find the Kimi binary.
+
+---
+
+## OpenAI-compatible endpoint (`/v1`)
+
+The proxy also speaks the standard OpenAI chat-completions protocol, so tools
+that expect an OpenAI API (agent harnesses, OpenAI SDKs, LibreChat-style UIs)
+can use your Kimi membership as a model.
+
+### `GET /v1/models`
+
+```json
+{ "object": "list", "data": [{ "id": "kimi-code", "object": "model", "created": 0, "owned_by": "kimi-proxy" }] }
+```
+
+### `POST /v1/chat/completions`
+
+Standard OpenAI request body: `messages`, optional `tools`, `stream`,
+`temperature`, `max_tokens`.
+
+```bash
+curl -sS http://YOUR_SERVER_IP:8083/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model":"kimi-code","messages":[{"role":"user","content":"Say hello."}]}'
+```
+
+- **Stateless**: the full `messages` history is sent to the CLI on every call.
+- **Brain-only**: the CLI runs with tools disabled — it cannot execute anything.
+- **Tool calling**: OpenAI `tools` schemas are translated into a structured
+  output contract; responses come back as standard `tool_calls` (or plain
+  `content`). If the model ever ignores the contract you get plain text, never
+  an error.
+- **Streaming**: `stream:true` returns SSE chunks.
+- Point any OpenAI client at `http://YOUR_SERVER_IP:8083/v1` (API key only
+  needed if you set `PROXY_API_KEY`).
 
 ---
 

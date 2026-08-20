@@ -13,7 +13,7 @@ const path = require('path');
 // ============================================================================
 // Configuration
 // ============================================================================
-const SERVICE_VERSION = '3.0.0';
+const SERVICE_VERSION = '3.1.0';
 const PORT = process.env.PORT || 8080;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOGS_DIR = process.env.LOGS_DIR || path.join(__dirname, 'logs');
@@ -115,6 +115,11 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
       args.push('--model', options.model);
     }
 
+    // Extra CLI flags (e.g. ['--agent-file', path] for the /v1 brain mode)
+    if (Array.isArray(options.extraArgs) && options.extraArgs.length) {
+      args.push(...options.extraArgs);
+    }
+
     logger.info({
       requestId,
       type: 'kimi_start',
@@ -138,11 +143,29 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
     let output = '';
     let stderr = '';
     let firstDataTime = null;
+    let lineBuf = '';
 
     kimi.stdout.on('data', (d) => {
       if (!firstDataTime) firstDataTime = Date.now();
       const chunk = d.toString();
       output += chunk;
+
+      // NDJSON line callback for stream-json consumers (the /v1 surface)
+      if (options.onLine) {
+        lineBuf += chunk;
+        let idx;
+        while ((idx = lineBuf.indexOf('\n')) >= 0) {
+          const line = lineBuf.slice(0, idx).trim();
+          lineBuf = lineBuf.slice(idx + 1);
+          if (line) {
+            try {
+              options.onLine(JSON.parse(line));
+            } catch {
+              // non-JSON line — ignore
+            }
+          }
+        }
+      }
       logger.debug({
         requestId,
         type: 'kimi_stdout_chunk',
@@ -234,6 +257,12 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
 }
 
 // ============================================================================
+// OpenAI-compatible /v1 surface (see openai.js)
+// ============================================================================
+const { createV1Handler } = require('./openai');
+const v1 = createV1Handler({ runKimi, logger });
+
+// ============================================================================
 // HTTP server
 // ============================================================================
 const server = http.createServer(async (req, res) => {
@@ -241,12 +270,26 @@ const server = http.createServer(async (req, res) => {
   const startTime = Date.now();
 
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'POST, OPTIONS');
-  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  res.setHeader('Access-Control-Allow-Methods', 'POST, GET, OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization');
 
   if (req.method === 'OPTIONS') {
     res.writeHead(200);
     res.end();
+    return;
+  }
+
+  const reqPath = (req.url || '').split('?')[0];
+
+  // OpenAI-compatible surface: GET /v1/models
+  if (reqPath === '/v1/models' && req.method === 'GET') {
+    if (!v1.authorized(req)) {
+      res.writeHead(401, { 'Content-Type': 'application/json' });
+      res.end(JSON.stringify({ error: { message: 'invalid API key', type: 'invalid_request_error', param: null, code: 'invalid_api_key' } }));
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/json' });
+    res.end(JSON.stringify(v1.modelsPayload()));
     return;
   }
 
@@ -285,6 +328,17 @@ const server = http.createServer(async (req, res) => {
       }, `[${requestId}] HTTP ${req.method} ${req.url} (${body.length} chars)`);
 
       const data = JSON.parse(body);
+
+      // OpenAI-compatible chat completions → headless Kimi brain
+      if (reqPath === '/v1/chat/completions') {
+        if (!v1.authorized(req)) {
+          res.writeHead(401, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify({ error: { message: 'invalid API key', type: 'invalid_request_error', param: null, code: 'invalid_api_key' } }));
+          return;
+        }
+        await v1.handleChat(req, res, requestId, data);
+        return;
+      }
 
       if (!data.prompt) {
         logger.error({ requestId, type: 'missing_prompt' }, 'Missing prompt');
