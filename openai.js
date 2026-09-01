@@ -213,7 +213,8 @@ function createV1Handler({ runKimi, logger }) {
       return;
     }
 
-    let content = contentParts.join('\n');
+    const rawContent = contentParts.join('\n');
+    let content = rawContent;
     let toolCalls = null;
     if (tools) {
       const parsed = parseContract(content);
@@ -225,11 +226,21 @@ function createV1Handler({ runKimi, logger }) {
       }
     }
 
+    // CLI emits no token counts (checked v0.39.1) — chars/4 estimate.
+    // estimated:true marks it so dashboards don't mistake it for real usage.
+    const usage = {
+      prompt_tokens: Math.ceil(prompt.length / 4),
+      completion_tokens: Math.ceil(rawContent.length / 4),
+      total_tokens: Math.ceil((prompt.length + rawContent.length) / 4),
+      estimated: true
+    };
+
     logger.info({
       requestId,
       type: 'v1_chat_response',
       contentLength: content ? content.length : 0,
-      toolCalls: toolCalls ? toolCalls.map((t) => t.function.name) : null
+      toolCalls: toolCalls ? toolCalls.map((t) => t.function.name) : null,
+      usage
     }, `[${requestId}] /v1/chat/completions done (tool_calls: ${toolCalls ? toolCalls.length : 0})`);
 
     if (wantStream) {
@@ -260,7 +271,8 @@ function createV1Handler({ runKimi, logger }) {
           ...(toolCalls ? { tool_calls: toolCalls } : {})
         },
         finish_reason: toolCalls ? 'tool_calls' : 'stop'
-      }]
+      }],
+      usage
     }));
   }
 

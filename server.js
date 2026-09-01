@@ -238,6 +238,14 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
         requestId,
         type: 'kimi_response',
         responseLength: responseText.length,
+        // CLI emits no token counts (checked v0.39.1) — chars/4 estimate so
+        // the stats collector gets per-request usage. estimated:true marks it.
+        usage: {
+          prompt_tokens: Math.ceil(prompt.length / 4),
+          completion_tokens: Math.ceil(responseText.length / 4),
+          total_tokens: Math.ceil((prompt.length + responseText.length) / 4),
+          estimated: true
+        },
         ...(LOG_SENSITIVE ? { responseText } : {})
       }, `[${requestId}] Final response (${responseText.length} chars)`);
 
