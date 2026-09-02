@@ -1,10 +1,11 @@
 {
   "name": "kimi-proxy",
-  "version": "3.2.0",
+  "version": "3.2.1",
   "description": "HTTP proxy for Kimi Code CLI — turn your membership into a local LAN API",
   "main": "server.js",
   "scripts": {
-    "start": "node server.js"
+    "start": "node server.js",
+    "test": "node --test test/*.test.js"
   },
   "dependencies": {
     "pino": "^8.16.0"

@@ -173,6 +173,11 @@ curl -sS http://YOUR_SERVER_IP:8083/v1/chat/completions \
   output contract; responses come back as standard `tool_calls` (or plain
   `content`). If the model ever ignores the contract you get plain text, never
   an error.
+- **Thinking-only guard**: if a completion comes back with reasoning but no
+  text or tool calls (reasoning models can exhaust their token budget on
+  thinking), the proxy automatically retries with a lower thinking effort and
+  a larger budget, and returns HTTP 502 `thinking_only` only after those
+  retries also fail. Token `usage` is summed across all attempts.
 - **Streaming**: `stream:true` returns SSE chunks.
 - Point any OpenAI client at `http://YOUR_SERVER_IP:8083/v1` (API key only
   needed if you set `PROXY_API_KEY`).

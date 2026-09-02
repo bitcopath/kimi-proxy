@@ -21,7 +21,7 @@ WORKDIR /app
 COPY package.json .
 RUN npm install --omit=dev
 
-COPY server.js entrypoint.sh ./
+COPY server.js openai.js usage.js entrypoint.sh ./
 RUN chmod +x /app/entrypoint.sh \
     && mkdir -p /app/data /app/logs
 

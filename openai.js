@@ -12,6 +12,7 @@
  */
 
 const path = require('path');
+const { toOpenAiUsage } = require('./usage');
 
 const AGENT_FILE = path.join(__dirname, 'agents', 'openai-brain.md');
 const MODEL_ID = process.env.KIMI_V1_MODEL || 'kimi-code';
@@ -110,6 +111,60 @@ function parseContract(raw) {
 }
 
 // ============================================================================
+// Thinking-only completion detection + retry
+// ============================================================================
+//
+// k3 is an always-thinking model. When it burns its entire output budget on
+// reasoning, the CLI exits successfully but produces no assistant text: in
+// stream-json mode the CLI drops thinking deltas (writeThinkingDelta is a
+// no-op in its PromptJsonWriter) and flushes nothing when the text is empty,
+// so a thinking-only completion is observable here as "empty content, no
+// tool_calls, exit code 0". Passing that through makes callers (pi-ai /
+// DeepSeek Harness) fail the whole agent turn, so we retry instead.
+//
+// Retry knobs that genuinely exist in the kimi CLI (verified in its bundled
+// source: completion-budget.ts and kimi-env-params.ts):
+//   KIMI_MODEL_THINKING_EFFORT        — effort override (low/high/max),
+//                                       bypasses the model's support_efforts
+//   KIMI_MODEL_MAX_COMPLETION_TOKENS  — hard cap on output tokens
+// Neither has a CLI flag and config.toml is global, so per-run env vars
+// (runKimi options.env) are the only safe per-request path.
+
+const MAX_THINKING_ONLY_RETRIES = 2;
+const RETRY_THINKING_EFFORT = 'low';
+// Output budget per retry attempt: doubled, capped at a sane ceiling.
+const RETRY_MAX_COMPLETION_TOKENS = [65536, 131072];
+
+function isThinkingOnlyCompletion(content, toolCalls) {
+  const hasText = typeof content === 'string' && content.trim().length > 0;
+  const hasToolCalls = Array.isArray(toolCalls) && toolCalls.length > 0;
+  return !hasText && !hasToolCalls;
+}
+
+// attempt: 2 = first retry, 3 = second retry
+function retryEnv(attempt) {
+  const idx = Math.min(attempt - 2, RETRY_MAX_COMPLETION_TOKENS.length - 1);
+  return {
+    KIMI_MODEL_THINKING_EFFORT: RETRY_THINKING_EFFORT,
+    KIMI_MODEL_MAX_COMPLETION_TOKENS: String(RETRY_MAX_COMPLETION_TOKENS[idx])
+  };
+}
+
+// Sum the raw per-attempt usage records (usage.js shape) so the reported
+// usage reflects every CLI call actually made, retries included.
+function sumRawUsage(usages) {
+  const list = (usages || []).filter(Boolean);
+  if (!list.length) return null;
+  const sum = { inputOther: 0, output: 0, inputCacheRead: 0, inputCacheCreation: 0 };
+  for (const u of list) {
+    for (const key of Object.keys(sum)) {
+      if (typeof u[key] === 'number') sum[key] += u[key];
+    }
+  }
+  return sum;
+}
+
+// ============================================================================
 // Handler factory (wired with server.js's runKimi)
 // ============================================================================
 
@@ -184,6 +239,7 @@ function createV1Handler({ runKimi, logger }) {
     if (wantStream) sseHeaders(res);
 
     const contentParts = [];
+    const attemptUsages = [];
     const onLine = (obj) => {
       if (obj && obj.role === 'assistant' && typeof obj.content === 'string') {
         contentParts.push(obj.content);
@@ -193,47 +249,98 @@ function createV1Handler({ runKimi, logger }) {
       }
     };
 
-    try {
-      await runKimi(prompt, null, requestId, {
-        outputFormat: 'stream-json',
-        extraArgs: ['--agent-file', AGENT_FILE],
-        onLine
-      });
-    } catch (error) {
-      logger.error({ requestId, type: 'v1_chat_error', error: error.message },
-        `[${requestId}] /v1/chat/completions failed: ${error.message}`);
-      if (wantStream) {
-        sseSend(res, openaiError(`backend error: ${error.message}`, 'server_error'));
-        res.write('data: [DONE]\n\n');
-        res.end();
-      } else {
-        res.writeHead(500, { 'Content-Type': 'application/json' });
-        res.end(JSON.stringify(openaiError(`backend error: ${error.message}`, 'server_error')));
-      }
-      return;
-    }
-
-    const rawContent = contentParts.join('\n');
-    let content = rawContent;
+    let rawContent = '';
+    let content = null;
     let toolCalls = null;
-    if (tools) {
-      const parsed = parseContract(content);
-      if (parsed.toolCalls) {
-        toolCalls = parsed.toolCalls;
-        content = null;
-      } else {
-        content = parsed.content;
+    let attempt = 0;
+
+    // Retry loop for thinking-only completions. Streaming is safe here: a
+    // thinking-only attempt emits no assistant lines, so onLine never sent
+    // any content chunk for it and the retry starts from a clean slate.
+    while (true) {
+      attempt += 1;
+      contentParts.length = 0;
+      const env = attempt === 1 ? null : retryEnv(attempt);
+      if (env) {
+        logger.warn({
+          requestId,
+          type: 'v1_thinking_only_retry',
+          attempt,
+          retry: attempt - 1,
+          maxRetries: MAX_THINKING_ONLY_RETRIES,
+          reason: 'thinking-only completion (empty content, no tool_calls)',
+          retryEnv: env
+        }, `[${requestId}] thinking-only completion — retry ${attempt - 1}/${MAX_THINKING_ONLY_RETRIES} ` +
+           `(effort=${env.KIMI_MODEL_THINKING_EFFORT}, max_completion_tokens=${env.KIMI_MODEL_MAX_COMPLETION_TOKENS})`);
+      }
+
+      let result;
+      try {
+        result = await runKimi(prompt, null, requestId, {
+          outputFormat: 'stream-json',
+          extraArgs: ['--agent-file', AGENT_FILE],
+          onLine,
+          ...(env ? { env } : {})
+        });
+        if (result.usage) attemptUsages.push(result.usage);
+      } catch (error) {
+        logger.error({ requestId, type: 'v1_chat_error', error: error.message },
+          `[${requestId}] /v1/chat/completions failed: ${error.message}`);
+        if (wantStream) {
+          sseSend(res, openaiError(`backend error: ${error.message}`, 'server_error'));
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } else {
+          res.writeHead(500, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(openaiError(`backend error: ${error.message}`, 'server_error')));
+        }
+        return;
+      }
+
+      rawContent = contentParts.join('\n');
+      content = rawContent;
+      toolCalls = null;
+      if (tools) {
+        const parsed = parseContract(content);
+        if (parsed.toolCalls) {
+          toolCalls = parsed.toolCalls;
+          content = null;
+        } else {
+          content = parsed.content;
+        }
+      }
+
+      if (!isThinkingOnlyCompletion(content, toolCalls)) break;
+
+      if (attempt > MAX_THINKING_ONLY_RETRIES) {
+        // All attempts (initial + retries) came back thinking-only. Do NOT
+        // fabricate content — return 502 so the caller's retry logic can
+        // try again later.
+        const usage = toOpenAiUsage(sumRawUsage(attemptUsages), prompt.length, 0);
+        logger.error({
+          requestId,
+          type: 'v1_thinking_only_exhausted',
+          attempts: attempt,
+          usage
+        }, `[${requestId}] thinking-only response after ${MAX_THINKING_ONLY_RETRIES} retries — returning 502`);
+        const message = `kimi thinking-only response after ${MAX_THINKING_ONLY_RETRIES} retries; retry the request`;
+        if (wantStream) {
+          sseSend(res, openaiError(message, 'server_error', 'thinking_only'));
+          res.write('data: [DONE]\n\n');
+          res.end();
+        } else {
+          res.writeHead(502, { 'Content-Type': 'application/json' });
+          res.end(JSON.stringify(openaiError(message, 'server_error', 'thinking_only')));
+        }
+        return;
       }
     }
 
-    // CLI emits no token counts (checked v0.39.1) — chars/4 estimate.
-    // estimated:true marks it so dashboards don't mistake it for real usage.
-    const usage = {
-      prompt_tokens: Math.ceil(prompt.length / 4),
-      completion_tokens: Math.ceil(rawContent.length / 4),
-      total_tokens: Math.ceil((prompt.length + rawContent.length) / 4),
-      estimated: true
-    };
+    // Real token counts from the CLI's session wire log (see usage.js),
+    // summed across all attempts so retries are accounted for.
+    // estimated:true only when no usage records could be parsed (e.g. the
+    // CLI wrote no wire log), so dashboards can tell it apart from real usage.
+    const usage = toOpenAiUsage(sumRawUsage(attemptUsages), prompt.length, rawContent.length);
 
     logger.info({
       requestId,
@@ -279,4 +386,4 @@ function createV1Handler({ runKimi, logger }) {
   return { authorized, modelsPayload, handleChat, MODEL_ID };
 }
 
-module.exports = { createV1Handler };
+module.exports = { createV1Handler, isThinkingOnlyCompletion };

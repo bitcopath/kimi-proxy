@@ -9,11 +9,12 @@ const { spawn } = require('child_process');
 const pino = require('pino');
 const fs = require('fs');
 const path = require('path');
+const { extractSessionId, readSessionUsage, toOpenAiUsage } = require('./usage');
 
 // ============================================================================
 // Configuration
 // ============================================================================
-const SERVICE_VERSION = '3.1.0';
+const SERVICE_VERSION = '3.2.1';
 const PORT = process.env.PORT || 8080;
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, 'data');
 const LOGS_DIR = process.env.LOGS_DIR || path.join(__dirname, 'logs');
@@ -98,6 +99,11 @@ const tracker = new RequestTracker();
 
 // ============================================================================
 // Run Kimi CLI
+// Resolves { response, usage, sessionId, durationMs }:
+//   - response: extracted response text
+//   - usage: real per-request token usage summed from the CLI's session wire
+//     log (see usage.js), or null when it could not be parsed
+//   - sessionId: the CLI session id (passed in, or parsed from CLI output)
 // ============================================================================
 function runKimi(prompt, sessionId, requestId, options = {}) {
   return new Promise((resolve, reject) => {
@@ -120,6 +126,11 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
       args.push(...options.extraArgs);
     }
 
+    // Extra env vars merged over kimiEnv() for this run only (e.g. the /v1
+    // surface's thinking-only retry knobs: KIMI_MODEL_THINKING_EFFORT,
+    // KIMI_MODEL_MAX_COMPLETION_TOKENS).
+    const extraEnv = options.env && typeof options.env === 'object' ? options.env : null;
+
     logger.info({
       requestId,
       type: 'kimi_start',
@@ -128,6 +139,7 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
       sessionId: sessionId || null,
       hasSession: !!sessionId,
       model: options.model || null,
+      ...(extraEnv ? { extraEnv } : {}),
       ...(LOG_SENSITIVE ? { fullPrompt: prompt, args } : {})
     }, `[${requestId}] Starting Kimi CLI (${prompt.length} chars, session: ${sessionId || 'none'})`);
 
@@ -137,7 +149,7 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
 
     const kimi = spawn(KIMI_BIN, args, {
       cwd: DATA_DIR,
-      env: kimiEnv()
+      env: extraEnv ? { ...kimiEnv(), ...extraEnv } : kimiEnv()
     });
 
     let output = '';
@@ -234,22 +246,24 @@ function runKimi(prompt, sessionId, requestId, options = {}) {
         }
       }
 
+      // Real usage comes from the session wire log the CLI writes per run
+      // ($HOME/.kimi-code/sessions/*/<session_id>/agents/*/wire.jsonl).
+      // The `start` filter keeps resumed sessions from re-counting old turns.
+      const effectiveSessionId = sessionId || extractSessionId(output, stderr);
+      const usage = readSessionUsage(kimiEnv().HOME, effectiveSessionId, start);
+
       logger.info({
         requestId,
         type: 'kimi_response',
         responseLength: responseText.length,
-        // CLI emits no token counts (checked v0.39.1) — chars/4 estimate so
-        // the stats collector gets per-request usage. estimated:true marks it.
-        usage: {
-          prompt_tokens: Math.ceil(prompt.length / 4),
-          completion_tokens: Math.ceil(responseText.length / 4),
-          total_tokens: Math.ceil((prompt.length + responseText.length) / 4),
-          estimated: true
-        },
+        sessionId: effectiveSessionId || null,
+        // Real token counts from the CLI wire log (see usage.js);
+        // estimated:true only when no usage records could be parsed.
+        usage: toOpenAiUsage(usage, prompt.length, responseText.length),
         ...(LOG_SENSITIVE ? { responseText } : {})
       }, `[${requestId}] Final response (${responseText.length} chars)`);
 
-      resolve(responseText);
+      resolve({ response: responseText, usage, sessionId: effectiveSessionId, durationMs: duration });
     });
 
     kimi.on('error', (error) => {
@@ -375,17 +389,18 @@ const server = http.createServer(async (req, res) => {
         requestId,
         type: 'http_response',
         durationMs: duration,
-        responseLength: result.length,
-        ...(LOG_SENSITIVE ? { fullResponse: result } : {})
+        responseLength: result.response.length,
+        ...(LOG_SENSITIVE ? { fullResponse: result.response } : {})
       }, `[${requestId}] Response sent in ${duration}ms`);
 
       res.writeHead(200, { 'Content-Type': 'application/json' });
       res.end(JSON.stringify({
         success: true,
-        response: result,
+        response: result.response,
+        usage: toOpenAiUsage(result.usage, data.prompt.length, result.response.length),
         durationMs: duration,
         requestId,
-        sessionId: data.sessionId || null
+        sessionId: result.sessionId || data.sessionId || null
       }));
     } catch (error) {
       logger.error({
